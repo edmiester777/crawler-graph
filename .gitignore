@@ -178,3 +178,7 @@ cython_debug/
 # Support for Project snippet scope
 
 # End of https://www.toptal.com/developers/gitignore/api/python,visualstudiocode
+
+# Ignore generated data from docker
+neo4j_data/
+elastic_data/
