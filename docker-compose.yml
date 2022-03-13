@@ -20,3 +20,6 @@ services:
     volumes:
       - ./pg_data:/var/lib/postgres/data:rw
     
+  app:
+    build: .
+    network_mode: bridge

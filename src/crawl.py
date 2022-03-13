@@ -1,9 +1,3 @@
-from asyncio import wait_for
-from signal import SIGKILL
-from socket import timeout
-from threading import Timer
-from elasticsearch_dsl import UpdateByQuery
-import requests
 from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
 import os
 import re
@@ -16,6 +10,7 @@ from neomodels import Record as NeoRecord, initialize as neoinit
 import traceback
 from pony.orm import *
 from time import sleep
+import requests
 
 # seed url is used for initial url crawl. it is needed because at genesis
 # we don't have any stored urls to crawl.

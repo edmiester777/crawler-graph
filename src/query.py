@@ -46,5 +46,3 @@ def query_root_domain(domain:str):
     print('')
     table = [[link, links[link]] for link in links.keys()]
     print(tabulate(table, headers=["From Domain", "Number of links to this domain"]))
-
-query_root_domain('www.messenger.com')
