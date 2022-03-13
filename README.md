@@ -26,7 +26,38 @@ Setup database services:
 ```sh
 $ docker-compose up postgres neo4j
 ```
-Install python dependencies
+
+Run crawler to seed data. I recommend running with > 8 workers
 ```sh
-$ pip install -r requirements.txt
+$ docker-compose run app -crawl --workers=16
 ```
+
+Now that you have data populated, you can query the data to see
+who links to a given domain
+
+```sh
+$ docker-compose run app -query --domain=facebook.com
+```
+
+Results should resemble
+```
+Breakdown of connections from different root domains for facebook.com
+
+From Domain          Number of links to this domain
+-----------------  --------------------------------
+www.messenger.com                                11
+messenger.com                                     1
+```
+
+# Visualizing graph
+If you go to `localhost:7474` in a browser, you can use neo4j
+web interface to visualize data.
+
+An example query for links to/from facebook is
+```
+match (:Record {url: 'facebook.com'})<-[:LINKED_FROM]-(record)
+return record
+```
+
+You can click on the "graph" tab to see something like this:
+![fbgraph](img/fb-graph.png)
