@@ -10,7 +10,8 @@ class Record(Model):
     url = Property()
     title = Property()
 
-    linked = RelatedTo('Record', 'LINKED_TO')
+    linked_to = RelatedTo('Record', 'LINKED_TO')
+    linked_from = RelatedTo('Record', 'LINKED_FROM')
 
 def initialize():
     "Initialize neo4j connections."

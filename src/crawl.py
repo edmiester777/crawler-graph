@@ -1,5 +1,7 @@
 from asyncio import wait_for
+from signal import SIGKILL
 from socket import timeout
+from threading import Timer
 from elasticsearch_dsl import UpdateByQuery
 import requests
 from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
@@ -36,7 +38,8 @@ class CrawlerDispatcher:
     chunks to be loaded.
     """
     def __init__(self, nproc:int=16):
-        self.chunksize = nproc * 20
+        self.nproc = nproc
+        self.chunksize = nproc * 3
         self.executor = ProcessPoolExecutor(max_workers=nproc)
         self.workqueue = []
 
@@ -71,7 +74,15 @@ class CrawlerDispatcher:
 
         #processing this chunk
         futures = [self.executor.submit(process, item.normalized_url) for item in nextitems]
-        results, _ = wait(futures, return_when=ALL_COMPLETED)
+        results, failed = wait(futures, return_when=ALL_COMPLETED, timeout=25)
+
+        # if we timeout any futures, we will kill
+        if len(failed) > 0:
+            print(f'[{os.getpid}] Timeout has been detected. Killing subprocesses for recreation later.')
+            for _, proc in self.executor._processes.items():
+                proc.kill()
+            self.executor = ProcessPoolExecutor(max_workers=self.nproc)
+
         uresults = []
         for result in results:
             uresults += result.result()
@@ -164,9 +175,11 @@ def process(url:str) -> set[str]:
     2. Extract all normalized urls from links in content
     3. Add records to elasticsearch if necessary
     4. Update corresponding this url record in elasticsearch with fetched content
+
+    Upon a 5 second timeout, this process will be killed.
     """
     try:
-        record = PGCrawlerRecord[url]
+        record = PGCrawlerRecord.get_for_update(normalized_url=url)
 
         neoinit()
         neorepo = neomodels.neorepo
@@ -192,16 +205,19 @@ def process(url:str) -> set[str]:
 
         # adding links to graph
         gfrom = get_or_create_graph_node(record.normalized_url, title)
+        to_save = [gfrom]
         for linkurl in normalized_urls:
             gto = get_or_create_graph_node(linkurl)
-            gfrom.linked.add(gto)
+            gfrom.linked_to.add(gto)
+            gto.linked_from.add(gfrom)
+            to_save.append(gto)
 
         # saving additional links to graph
-        neorepo.save(gfrom)
+        neorepo.save(*to_save)
 
         print(f'[{os.getpid()}] Processed {record.normalized_url}')
-
         return normalized_urls
-    except Exception:
-        traceback.print_exc()
-        
+    except Exception as ex:
+        print(f'[{os.getpid()}] {ex}')
+
+    return set()   

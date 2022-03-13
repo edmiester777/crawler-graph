@@ -3,3 +3,4 @@ py2neo==2021.2.3
 requests==2.27.1
 psycopg2==2.9.3
 pony==0.7.16
+tabulate==0.8.9
