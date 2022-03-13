@@ -1,5 +1,0 @@
-# forcing development mode to avoid the error
-# [1]: max virtual memory areas vm.max_map_count [65530] is too low, increase to at least [262144]
-# we use dev mode because for this project, I don't really care about data loss
-discovery.type: single-node
-network.host: 0.0.0.0

@@ -1,19 +1,29 @@
+from asyncio import wait_for
+from socket import timeout
 from elasticsearch_dsl import UpdateByQuery
 import requests
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
 import os
 import re
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from datetime import datetime
 from pgmodels import PGCrawlerRecord
+import neomodels
+from neomodels import Record as NeoRecord, initialize as neoinit
+import traceback
+from pony.orm import *
+from time import sleep
 
 # seed url is used for initial url crawl. it is needed because at genesis
 # we don't have any stored urls to crawl.
-SEED_URL = 'google.com'
-
-# number of documents to pull from elasticsearch in each batch
-WORK_QUEUE_SIZE = 500
+SEED_URLS = [
+    'amazon.com',
+    'google.com',
+    'bing.com',
+    'youtube.com',
+    'facebook.com'
+]
 
 class CrawlerDispatcher:
     """
@@ -25,7 +35,8 @@ class CrawlerDispatcher:
     to implement it in a streamed fashion so that we have no downtime in pool waiting for
     chunks to be loaded.
     """
-    def __init__(self, nproc:int=30):
+    def __init__(self, nproc:int=16):
+        self.chunksize = nproc * 20
         self.executor = ProcessPoolExecutor(max_workers=nproc)
         self.workqueue = []
 
@@ -33,44 +44,49 @@ class CrawlerDispatcher:
         """
         Start the crawling process. This will continue until we receive a keyboard interrupt.
         """
-        try:
-            while True:
-                # we want to find items queued to be crawled
-                nextitems = PGCrawlerRecord.select() \
-                    .limit(WORK_QUEUE_SIZE) \
-                    .where(PGCrawlerRecord.crawled == False)
+        while True:
+            try:
+                self.main_iter()
+            except KeyboardInterrupt:
+                print('Process interrupted.')
+                break
+            except Exception:
+                # simply continue loop here.
+                traceback.print_exc()
+                sleep(0.4)
+    @db_session
+    def main_iter(self):
+        """
+        Main work function. This handles the bulk of the work for dispatching events
+        and maintaining state.
+        """
+        # we want to find items queued to be crawled
+        nextitems = select(item for item in PGCrawlerRecord if item.crawled == False)[:self.chunksize]
 
-                if len(nextitems) == 0:
-                    # we did not receive any records. assume this is our first time running and
-                    # add the seed record. then continue loop
-                    PGCrawlerRecord.create(
-                        normalized_url=SEED_URL,
-                        crawled=False,
-                        crawled_date=datetime.now()
-                    )
-                    continue
+        if len(nextitems) == 0:
+            # we did not receive any records. assume this is our first time running and
+            # add the seed record. then continue loop
+            nextitems = [PGCrawlerRecord(normalized_url=url, crawled=False) for url in SEED_URLS]
+            commit()
 
-                #processing this chunk
-                futures = [self.executor.submit(process, record) for record in nextitems]
-                
-                # getting unique list of all results from chunk
-                results = []
-                for f in futures:
-                    results += f.result()
-                results = set(results)
+        #processing this chunk
+        futures = [self.executor.submit(process, item.normalized_url) for item in nextitems]
+        results, _ = wait(futures, return_when=ALL_COMPLETED)
+        uresults = []
+        for result in results:
+            uresults += result.result()
+        uresults = set(uresults)
 
-                # removing any results that already exist in pg
-                exists = [r.normalized_url for r in PGCrawlerRecord.filter(PGCrawlerRecord.normalized_url << results)]
-                results -= set(exists)
-
-                # adding any new urls to future crawl list
-                newrecords = [PGCrawlerRecord(normalized_url=url, crawled=False, crawled_date=datetime.now()) for url in results]
-                PGCrawlerRecord.bulk_create(newrecords)
-                print(f'[{os.getpid()}] Created {len(newrecords)} future crawl records.')
-                
-
-        except (KeyboardInterrupt):
-            print('Keyboard interrupt detected.')
+        # adding any new urls to future crawl list
+        # we need to catch unique constraint errors because pony orm doesn't support
+        # "where in" clauses for us to grab a list of records.
+        numnewrecs = 0
+        for nurl in uresults:
+            if not PGCrawlerRecord.exists(normalized_url=nurl):
+                PGCrawlerRecord(normalized_url=nurl, crawled=False)
+                numnewrecs += 1
+        
+        print(f'[{os.getpid()}] Created {numnewrecs} future crawl records.')
 
 
 def normalizeurl(url: str) -> str:
@@ -95,30 +111,52 @@ def get_links_from_normalized_url(normalized_url: str) -> tuple[str, str, set[st
     """
     Make request to url and parse HTML for other links.
     """
-    response = requests.get('https://' + normalized_url)
-    if response.status_code != 200:
-        print(f'[{os.getpid()}] URL {normalized_url} responded with status code {response.status_code}')
-        return None
+    try:
+        response = requests.get('https://' + normalized_url, timeout=5)
+        if response.status_code != 200:
+            print(f'[{os.getpid()}] URL {normalized_url} responded with status code {response.status_code}')
+            return None
 
-    # early fail if HTML has not been returned
-    if 'text/html' not in response.headers['content-type']:
-        print(f'[{os.getpid()}] HTML content type not returned from {normalized_url}')
-        return None
+        # early fail if HTML has not been returned
+        if 'text/html' not in response.headers['content-type']:
+            print(f'[{os.getpid()}] HTML content type not returned from {normalized_url}')
+            return None
 
-    # parse content
-    soup = BeautifulSoup(response.text, "html.parser")
+        # parse content
+        soup = BeautifulSoup(response.text, "html.parser")
 
-    # get title string
-    titletag = soup.find('title')
-    titlestr = "" if titletag is None else titletag.string
+        # get title string
+        titletag = soup.find('title')
+        titlestr = "" if titletag is None else titletag.get_text()
 
-    # extract all links from document
-    linktags = soup.find_all('a', attrs={'href': re.compile('https://')})
+        # extract all links from document
+        linktags = soup.find_all('a', attrs={'href': re.compile('https://')})
 
-    # return a set of all links found
-    return titlestr, response.text, set([normalizeurl(link.get('href')) for link in linktags])
+        # return a set of all links found
+        return titlestr, response.text, set([normalizeurl(link.get('href')) for link in linktags])
+    except:
+        traceback.print_exc()
+    
+    return None
 
-def process(record:PGCrawlerRecord) -> set[str]:
+def get_or_create_graph_node(url, title:str|None=None) -> NeoRecord:
+    "Get a graph node if one exists, else create it."
+    neorepo = neomodels.neorepo
+    node:NeoRecord = neorepo.match(NeoRecord, url).first()
+    if node is None:
+        node = NeoRecord(
+            url=url,
+            title=title
+        )
+        neorepo.create(node)
+
+    if node.title != title:
+        node.title = title
+        neorepo.save(node)
+    return node
+
+@db_session
+def process(url:str) -> set[str]:
     """
     Main processpool entrypoint. Will do the following:
 
@@ -127,27 +165,43 @@ def process(record:PGCrawlerRecord) -> set[str]:
     3. Add records to elasticsearch if necessary
     4. Update corresponding this url record in elasticsearch with fetched content
     """
-    response = get_links_from_normalized_url(record.normalized_url)
+    try:
+        record = PGCrawlerRecord[url]
 
-    # if we encountered some issues in get step, we will set success flag to false
-    if response is None:
-        print(f'[{os.getpid}] Failed to process {record.normalized_url}.')
-        record.update(
-            sucess=False,
-            crawled_date=datetime.now()
-        )
+        neoinit()
+        neorepo = neomodels.neorepo
+        response = get_links_from_normalized_url(record.normalized_url)
 
-    # updating pg record with data
-    title, text, normalized_urls = response
-    record.update(
-        success=True,
-        title=title,
-        body=text,
-        crawled_date=datetime.now(),
-        crawled=True
-    )
+        # if we encountered some issues in get step, we will set success flag to false
+        if response is None:
+            print(f'[{os.getpid()}] Failed to process {record.normalized_url}.')
+            record.crawled = True
+            record.success = False
+            record.crawled_date = datetime.now()
+            commit()
+            return set()
 
-    print(f'[{os.getpid()}] Processed {record.normalized_url}')
+        # updating pg record with data
+        title, text, normalized_urls = response
+        record.success = True
+        record.title = title
+        record.body = text
+        record.crawled_date = datetime.now()
+        record.crawled = True
+        commit()
 
-    return normalized_urls
+        # adding links to graph
+        gfrom = get_or_create_graph_node(record.normalized_url, title)
+        for linkurl in normalized_urls:
+            gto = get_or_create_graph_node(linkurl)
+            gfrom.linked.add(gto)
+
+        # saving additional links to graph
+        neorepo.save(gfrom)
+
+        print(f'[{os.getpid()}] Processed {record.normalized_url}')
+
+        return normalized_urls
+    except Exception:
+        traceback.print_exc()
         

@@ -1,25 +1,21 @@
-from peewee import *
+from datetime import datetime
+from pony.orm import *
 
-connection = PostgresqlDatabase('postgres', # use postgres database for simplicity
-    host='host.docker.internal',
-    port=5432,
+db = Database()
+db.bind(
+    provider='postgres', 
+    host='host.docker.internal', 
     user='postgres',
-    password='pass'
+    password='pass', 
+    database='postgres'
 )
 
-class BaseModel(Model):
-    class Meta:
-        database=connection
+class PGCrawlerRecord(db.Entity):
+    normalized_url = PrimaryKey(str)
+    crawled = Required(bool)
+    success = Optional(bool)
+    title = Optional(str)
+    body = Optional(str)
+    crawled_date = Optional(datetime)
 
-class PGCrawlerRecord(BaseModel):
-    normalized_url=TextField(primary_key=True, unique=True)
-    crawled=BooleanField()
-    title=TextField(True)
-    body=TextField(True)
-    success=BooleanField(True)
-    crawled_date=DateTimeField()
-
-
-def initialize():
-    connection.connect(False)
-    PGCrawlerRecord.create_table()
+db.generate_mapping(create_tables=True)
