@@ -1,0 +1,5 @@
+beautifulsoup4==4.8.1
+py2neo==2021.2.3
+requests==2.27.1
+peewee==3.14.10
+psycopg2==2.9.3

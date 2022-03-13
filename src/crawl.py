@@ -1,11 +1,12 @@
+from elasticsearch_dsl import UpdateByQuery
 import requests
 from concurrent.futures import ProcessPoolExecutor
 import os
-import logging
+import re
 from urllib.parse import urlparse
-from elasticsearch_dsl.response import Response
-
-from esdocuments import ESCrawlDocument
+from bs4 import BeautifulSoup
+from datetime import datetime
+from pgmodels import PGCrawlerRecord
 
 # seed url is used for initial url crawl. it is needed because at genesis
 # we don't have any stored urls to crawl.
@@ -34,27 +35,42 @@ class CrawlerDispatcher:
         """
         try:
             while True:
-                # searching for crawl records. Will continue from last checkpoint.
-                response:Response = ESCrawlDocument.search() \
-                    .query('match', crawled=False) \
-                    [0:WORK_QUEUE_SIZE].execute()
+                # we want to find items queued to be crawled
+                nextitems = PGCrawlerRecord.select() \
+                    .limit(WORK_QUEUE_SIZE) \
+                    .where(PGCrawlerRecord.crawled == False)
 
-                # if there are no records to crawl, we assume we have not yet seeded
-                # the database. We will seed and then jump to next iteration.
-                if len(response) == 0:
-                    logging.debug('No records to crawl. Seeding ES and restarting.')
-                    ESCrawlDocument(normailzed_url=SEED_URL, crawled=False).save()
+                if len(nextitems) == 0:
+                    # we did not receive any records. assume this is our first time running and
+                    # add the seed record. then continue loop
+                    PGCrawlerRecord.create(
+                        normalized_url=SEED_URL,
+                        crawled=False,
+                        crawled_date=datetime.now()
+                    )
                     continue
 
-                # setting workqueue to the normalized_url of results
-                self.workqueue = [hit['normailzed_url'] for hit in response.hits]
+                #processing this chunk
+                futures = [self.executor.submit(process, record) for record in nextitems]
+                
+                # getting unique list of all results from chunk
+                results = []
+                for f in futures:
+                    results += f.result()
+                results = set(results)
 
-                # submitting work to pool and waiting for finish
-                self.executor.submit(self.workqueue).result()
+                # removing any results that already exist in pg
+                exists = [r.normalized_url for r in PGCrawlerRecord.filter(PGCrawlerRecord.normalized_url << results)]
+                results -= set(exists)
 
+                # adding any new urls to future crawl list
+                newrecords = [PGCrawlerRecord(normalized_url=url, crawled=False, crawled_date=datetime.now()) for url in results]
+                PGCrawlerRecord.bulk_create(newrecords)
+                print(f'[{os.getpid()}] Created {len(newrecords)} future crawl records.')
+                
 
         except (KeyboardInterrupt):
-            logging.info('Keyboard interrupt detected.')
+            print('Keyboard interrupt detected.')
 
 
 def normalizeurl(url: str) -> str:
@@ -75,7 +91,63 @@ def normalizeurl(url: str) -> str:
 
     return normalized
 
+def get_links_from_normalized_url(normalized_url: str) -> tuple[str, str, set[str]]:
+    """
+    Make request to url and parse HTML for other links.
+    """
+    response = requests.get('https://' + normalized_url)
+    if response.status_code != 200:
+        print(f'[{os.getpid()}] URL {normalized_url} responded with status code {response.status_code}')
+        return None
 
-def process(url:str):
-    pass
+    # early fail if HTML has not been returned
+    if 'text/html' not in response.headers['content-type']:
+        print(f'[{os.getpid()}] HTML content type not returned from {normalized_url}')
+        return None
 
+    # parse content
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # get title string
+    titletag = soup.find('title')
+    titlestr = "" if titletag is None else titletag.string
+
+    # extract all links from document
+    linktags = soup.find_all('a', attrs={'href': re.compile('https://')})
+
+    # return a set of all links found
+    return titlestr, response.text, set([normalizeurl(link.get('href')) for link in linktags])
+
+def process(record:PGCrawlerRecord) -> set[str]:
+    """
+    Main processpool entrypoint. Will do the following:
+
+    1. Fetch content from URL
+    2. Extract all normalized urls from links in content
+    3. Add records to elasticsearch if necessary
+    4. Update corresponding this url record in elasticsearch with fetched content
+    """
+    response = get_links_from_normalized_url(record.normalized_url)
+
+    # if we encountered some issues in get step, we will set success flag to false
+    if response is None:
+        print(f'[{os.getpid}] Failed to process {record.normalized_url}.')
+        record.update(
+            sucess=False,
+            crawled_date=datetime.now()
+        )
+
+    # updating pg record with data
+    title, text, normalized_urls = response
+    record.update(
+        success=True,
+        title=title,
+        body=text,
+        crawled_date=datetime.now(),
+        crawled=True
+    )
+
+    print(f'[{os.getpid()}] Processed {record.normalized_url}')
+
+    return normalized_urls
+        

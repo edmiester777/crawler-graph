@@ -5,15 +5,17 @@ services:
     ports:
       - 7687:7687 # database connection
       - 7474:7474 # web interface
+    # network_mode: host
     environment:
-      NEO4J_AUTH: none # connect with username "test" and password "test"
+      NEO4J_AUTH: none # connect with no authentication
     volumes:
       - ./neo4j_data:/data:rw
-  elk:
-    image: sebp/elk
+  postgres:
+    image: postgres:14.2
     ports:
-      - 5601:5601 # kibana
-      - 9200:9200 # elasticsearch
+      - 5432:5432
+    environment:
+      POSTGRES_PASSWORD: pass
     volumes:
-      - ./elastic_data:/var/lib/elasticsearch:rw
-      - ./elasticsearch.yml:/etc/elasticsearch/elasticsearch.yml
+      - ./pg_data:/var/lib/postgresql/data
+    

@@ -182,3 +182,4 @@ cython_debug/
 # Ignore generated data from docker
 neo4j_data/
 elastic_data/
+pg_data/
