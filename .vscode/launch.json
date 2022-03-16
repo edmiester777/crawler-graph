@@ -17,6 +17,7 @@
             "type": "python",
             "request": "launch",
             "program": "main.py",
+            "args": ["-crawl", "--workers=16"],
             "console": "integratedTerminal",
             "justMyCode": true,
             "cwd": "${workspaceFolder}/src"
@@ -26,6 +27,7 @@
             "type": "python",
             "request": "launch",
             "program": "main.py",
+            "args": ["-query", "--domain=facebook.com"],
             "console": "integratedTerminal",
             "justMyCode": true,
             "cwd": "${workspaceFolder}/src"

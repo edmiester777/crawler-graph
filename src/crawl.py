@@ -1,16 +1,19 @@
-from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
 import os
 import re
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup
-from datetime import datetime
-from pgmodels import PGCrawlerRecord
-import neomodels
-from neomodels import Record as NeoRecord, initialize as neoinit
 import traceback
-from pony.orm import *
+from asyncio import Future
+from concurrent.futures import ALL_COMPLETED, ProcessPoolExecutor, wait
+from datetime import datetime
 from time import sleep
+from urllib.parse import urlparse
+
 import requests
+from bs4 import BeautifulSoup
+from pony.orm import *
+from py2neo.bulk import merge_nodes, merge_relationships
+
+import neomodels
+from pgmodels import PGCrawlerRecord
 
 # seed url is used for initial url crawl. it is needed because at genesis
 # we don't have any stored urls to crawl.
@@ -21,6 +24,25 @@ SEED_URLS = [
     'youtube.com',
     'facebook.com'
 ]
+
+class CrawlResult:
+    "Structure for a result from a completed crawl."
+    def __init__(
+        self, 
+        url:str,
+        crawled_time:datetime,
+        success:bool,
+        title:str|None=None,
+        body:str|None=None,
+        links:set[str]|None=None
+    ) -> None:
+        self.url = url
+        self.crawled_time = crawled_time
+        self.success = success
+        self.title = title
+        self.body = body
+        self.links = links if links is not None else set()
+        
 
 class CrawlerDispatcher:
     """
@@ -36,12 +58,14 @@ class CrawlerDispatcher:
         self.nproc = nproc
         self.chunksize = nproc * 3
         self.executor = ProcessPoolExecutor(max_workers=nproc)
+        self.write_executor = ProcessPoolExecutor(max_workers=2)
         self.workqueue = []
 
     def begin(self):
         """
         Start the crawling process. This will continue until we receive a keyboard interrupt.
         """
+        write_operations:list[Future] = None
         while True:
             try:
                 self.main_iter()
@@ -57,11 +81,13 @@ class CrawlerDispatcher:
         """
         Main work function. This handles the bulk of the work for dispatching events
         and maintaining state.
+
+        :return Future for write process
         """
         nextitems = self.get_next_records()
 
         #processing this chunk
-        futures = [self.executor.submit(process, item) for item in nextitems]
+        futures = [self.executor.submit(process_crawl, item) for item in nextitems]
         results, failed = wait(futures, return_when=ALL_COMPLETED, timeout=60)
 
         # if we timeout any futures, we will kill
@@ -71,12 +97,14 @@ class CrawlerDispatcher:
                 proc.kill()
             self.executor = ProcessPoolExecutor(max_workers=self.nproc)
 
-        uresults = []
-        for result in results:
-            uresults += result.result()
-        uresults = set(uresults)
+        # unwrapping results
+        results = [result.result() for result in results]
 
-        self.add_new_crawl_records(uresults)
+        # Processing write operations asynchronously
+        wait([
+            self.executor.submit(process_write_neo4j, results),
+            self.executor.submit(process_write_postgres, results)
+        ], return_when=ALL_COMPLETED)
     
     @db_session
     def get_next_records(self) -> set[str]:
@@ -95,27 +123,6 @@ class CrawlerDispatcher:
             commit()
 
         return set([i.normalized_url for i in nextitems])
-
-    @db_session
-    def add_new_crawl_records(self, newrecs:set[str]):
-        """
-        Add all new URLs to the crawl list.
-        """
-        
-        # fetching records that already exist in database with same url
-        exists = select(r for r in PGCrawlerRecord if r.normalized_url in newrecs)[:]
-        existsurls = set([r.normalized_url for r in exists])
-
-        # filtering any existing records
-        inserturls = set([url for url in newrecs if url not in existsurls])
-
-        # inserting new records one by one.
-        # pony orm does not (from what I can find) yet support bulk insert operations.
-        for url in inserturls:
-            PGCrawlerRecord(normalized_url=url, crawled=False)
-        
-        print(f'[{os.getpid()}] Created {len(inserturls)} future crawl records.')
-
 
 
 def normalizeurl(url: str) -> str:
@@ -168,76 +175,153 @@ def get_links_from_normalized_url(normalized_url: str) -> tuple[str, str, set[st
     
     return None
 
-def get_or_construct_graph_node(url, title:str|None=None) -> NeoRecord:
+def process_write_neo4j(results:list[CrawlResult]):
     """
-    Get a graph node if one exists, else construct an (unsaved) object.
+    Async writer process. This is done so we may continue to crawl while we perform
+    our intense neo4j write operations.
 
-    Note: You need to explicitly save the resulting record.
+    In this process, we will
+    1. Update existing neo4j records with data from crawl results
+    2. Link together all crawl results with their corresponding links
+    3. Bulk write modified data
+
+    :param results list of results from crawl operations
     """
-    neorepo = neomodels.neorepo
-    node:NeoRecord = neorepo.match(NeoRecord, url).first()
-    if node is None:
-        node = NeoRecord(
-            url=url,
-            title=title
+    try:
+        neomodels.initialize()
+        graph = neomodels.graph
+
+        # organizing data
+        all_new_links = set([link for cr in results for link in cr.links])
+
+        # Merging nodes
+        transaction = graph.begin()
+        gkeys = ['url', 'title']
+        ndata = [[cr.url, cr.title] for cr in results] \
+             + [[url, ''] for url in all_new_links]
+        merge_nodes(transaction, ndata, ('Record', 'url'), keys=gkeys, preserve=['url'])
+
+        # Linking all data together
+        ltodata = []
+        lfromdata = []
+        for cr in results:
+            for tolink in cr.links:
+                ltodata.append((cr.url, [], tolink))
+                lfromdata.append((tolink, [], cr.url))
+
+        merge_relationships(
+            transaction,
+            ltodata,
+            'LINKED_TO',
+            start_node_key=('Record', 'url'),
+            end_node_key=('Record', 'url'),
+            keys=['url']
+        )
+        merge_relationships(
+            transaction,
+            lfromdata,
+            'LINKED_FROM',
+            start_node_key=('Record', 'url'),
+            end_node_key=('Record', 'url'),
+            keys=['url']
         )
 
-    if title is not None and node.title != title:
-        node.title = title
-    return node
+        transaction.commit()
+
+        print(f'[{os.getpid()}] Updated {len(ndata)} nodes with {len(ltodata) + len(lfromdata)} links.')
+
+    except Exception as ex:
+        print(f'[{os.getpid()}] {ex}')
 
 @db_session
-def process(url:str) -> set[str]:
+def process_write_postgres(results:list[CrawlResult]):
+    """
+    Async writer process. This is done so we may continue to crawl while we perform
+    our intense postgres write operations.
+
+    In this process, we will
+    1. Update all dispatched crawl records with the results
+    2. Add new crawl records for any new URLs to be crawled in the future
+
+    :param results list of results from crawl operations
+    """
+    try:
+        # organizing data
+        bucketized_results:dict[str, CrawlResult] = {cr.url: cr for cr in results}
+        all_crawled_urls = [cr.url for cr in results]
+        all_new_links = set([link for cr in results for link in cr.links])
+
+        # Updating all crawled records
+        crawled_records:list[PGCrawlerRecord] = select(r for r in PGCrawlerRecord if r.normalized_url in all_crawled_urls)[:]
+        for pgrecord in crawled_records:
+            crecord = bucketized_results[pgrecord.normalized_url]
+            pgrecord.crawled = True
+            pgrecord.crawled_date = crecord.crawled_time
+            pgrecord.success = crecord.success
+
+            if crecord.title is not None:
+                pgrecord.title = crecord.body
+
+            if crecord.body is not None:
+                pgrecord.body = crecord.body
+
+        print(f'[{os.getpid()}] Updated {len(crawled_records)} crawl records.')
+
+        # Finding all links that have already been added to our crawl records
+        exists_pgrecords:list[PGCrawlerRecord] = \
+            select(r for r in PGCrawlerRecord if r.normalized_url in all_new_links)[:]
+        existsurls = [r.normalized_url for r in exists_pgrecords]
+
+        # Adding new crawl records for any that do not already exists
+        newlinkurls = [url for url in all_new_links if url not in existsurls]
+        for newlink in newlinkurls:
+            PGCrawlerRecord(
+                normalized_url=newlink,
+                crawled=False
+            )
+
+        commit()
+        print(f'[{os.getpid()}] Added {len(newlinkurls)} new URLs for crawling.')
+    except Exception as ex:
+        print(f'[{os.getpid()}] {ex}')
+
+@db_session
+def process_crawl(url:str) -> CrawlResult:
     """
     Main processpool entrypoint. Will do the following:
 
     1. Fetch content from URL
     2. Extract all normalized urls from links in content
-    3. Add records to elasticsearch if necessary
-    4. Update corresponding this url record in elasticsearch with fetched content
+    3. Return results to dispatcher.
 
     Upon a 5 second timeout, this process will be killed.
+
+    :return result of process
     """
     try:
-        record = PGCrawlerRecord.get_for_update(normalized_url=url)
-
-        neoinit()
-        neorepo = neomodels.neorepo
-        response = get_links_from_normalized_url(record.normalized_url)
+        response = get_links_from_normalized_url(url)
 
         # if we encountered some issues in get step, we will set success flag to false
         if response is None:
-            print(f'[{os.getpid()}] Failed to process {record.normalized_url}.')
-            record.crawled = True
-            record.success = False
-            record.crawled_date = datetime.now()
-            commit()
-            return set()
+            print(f'[{os.getpid()}] Failed to process {url}.')
+            return CrawlResult(
+                url=url,
+                crawled_time=datetime.now(),
+                success=False
+            )
 
-        # updating pg record with data
+        # Processing complete. We can return our result
+        print(f'[{os.getpid()}] Processed {url}')
         title, text, normalized_urls = response
-        record.success = True
-        record.title = title
-        record.body = text
-        record.crawled_date = datetime.now()
-        record.crawled = True
-        commit()
-
-        # adding links to graph
-        gfrom = get_or_construct_graph_node(record.normalized_url, title)
-        to_save = [gfrom]
-        for linkurl in normalized_urls:
-            gto = get_or_construct_graph_node(linkurl)
-            gfrom.linked_to.add(gto)
-            gto.linked_from.add(gfrom)
-            to_save.append(gto)
-
-        # saving additional links to graph
-        neorepo.save(*to_save)
-
-        print(f'[{os.getpid()}] Processed {record.normalized_url}')
-        return normalized_urls
+        return CrawlResult(
+            url=url,
+            crawled_time=datetime.now(),
+            success=True,
+            title=title,
+            body=text,
+            links=normalized_urls
+        )
     except Exception as ex:
-        print(f'[{os.getpid()}] {ex}')
+        print(f'[{os.getpid()}] {ex.with_traceback()}')
 
-    return set()  
+    return url, set()  
