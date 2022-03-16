@@ -1,3 +1,4 @@
+from itertools import islice
 import os
 import re
 import traceback
@@ -61,6 +62,7 @@ class CrawlerDispatcher:
 
         # use threadpool because multiprocessing is not supported in neo4j driver
         self.write_executor = ThreadPoolExecutor(max_workers=nproc)
+        self.write_futures = []
 
         self.workqueue = []
 
@@ -69,10 +71,9 @@ class CrawlerDispatcher:
         Start the crawling process. This will continue until we receive a keyboard interrupt.
         """
         neomodels.initialize()
-        write_operations:list[Future] = None
         while True:
             try:
-                write_operations = self.main_iter(write_operations)
+                self.write_futures += self.main_iter()
             except KeyboardInterrupt:
                 print('Process interrupted.')
                 break
@@ -81,7 +82,7 @@ class CrawlerDispatcher:
                 traceback.print_exc()
                 sleep(0.4)
 
-    def main_iter(self, write_futures:list[Future]) -> list[Future]:
+    def main_iter(self) -> list[Future]:
         """
         Main work function. This handles the bulk of the work for dispatching events
         and maintaining state.
@@ -105,11 +106,10 @@ class CrawlerDispatcher:
         results = [result.result() for result in results]
 
         # if there are ongoing write operations, wait for them to complete
-        if write_futures is not None:
-            wait(write_futures, return_when=ALL_COMPLETED)
+        wait(self.write_futures, return_when=ALL_COMPLETED)
 
         # Processing write operations asynchronously
-        return [*[self.write_executor.submit(process_write_neo4j, result) for result in results],
+        return [*[self.write_executor.submit(process_write_neo4j, result, self) for result in results],
             self.write_executor.submit(process_write_postgres, results)]
     
     @db_session
@@ -181,7 +181,7 @@ def get_links_from_normalized_url(normalized_url: str) -> tuple[str, str, set[st
     
     return None
 
-def process_write_neo4j(result:CrawlResult):
+def process_write_neo4j(result:CrawlResult, dispatcher: CrawlerDispatcher):
     """
     Async writer process. This is done so we may continue to crawl while we perform
     our intense neo4j write operations.
@@ -201,6 +201,7 @@ def process_write_neo4j(result:CrawlResult):
         ndata = [[result.url, result.title]] \
              + [[url, ''] for url in result.links]
         merge_nodes(graph.auto(), ndata, ('Record', 'url'), keys=gkeys, preserve=['url'])
+        print(f'[{os.getpid()}] Added/updated {len(ndata)} nodes.')
 
         # Linking all data together
         ltodata = []
@@ -209,30 +210,29 @@ def process_write_neo4j(result:CrawlResult):
             ltodata.append((result.url, [], tolink))
             lfromdata.append((tolink, [], result.url))
 
-        transaction = graph.begin()
         merge_relationships(
-            transaction,
+            graph.auto(),
             ltodata,
             'LINKED_TO',
             start_node_key=('Record', 'url'),
             end_node_key=('Record', 'url'),
             keys=['url']
         )
+
         merge_relationships(
-            transaction,
+            graph.auto(),
             lfromdata,
             'LINKED_FROM',
             start_node_key=('Record', 'url'),
             end_node_key=('Record', 'url'),
             keys=['url']
         )
-
-        transaction.commit()
-
-        print(f'[{os.getpid()}] Updated {len(ndata)} nodes with {len(ltodata) + len(lfromdata)} links.')
+        print(f'[{os.getpid()}] Created {len(lfromdata) + len(ltodata)} relationships for {result.url}.')
 
     except Exception as ex:
-        print(f'[{os.getpid()}] {ex}')
+        # requeueing to re-process at a later time
+        print(f'[{os.getpid()}] Failed to update nodes for {result.url}. Requeuing: {ex}')
+        dispatcher.write_futures += [dispatcher.executor.submit(process_write_neo4j, result, dispatcher)]
 
 @db_session
 def process_write_postgres(results:list[CrawlResult]):
