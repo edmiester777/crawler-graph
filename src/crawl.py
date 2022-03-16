@@ -168,8 +168,12 @@ def get_links_from_normalized_url(normalized_url: str) -> tuple[str, str, set[st
     
     return None
 
-def get_or_create_graph_node(url, title:str|None=None) -> NeoRecord:
-    "Get a graph node if one exists, else create it."
+def get_or_construct_graph_node(url, title:str|None=None) -> NeoRecord:
+    """
+    Get a graph node if one exists, else construct an (unsaved) object.
+
+    Note: You need to explicitly save the resulting record.
+    """
     neorepo = neomodels.neorepo
     node:NeoRecord = neorepo.match(NeoRecord, url).first()
     if node is None:
@@ -177,11 +181,9 @@ def get_or_create_graph_node(url, title:str|None=None) -> NeoRecord:
             url=url,
             title=title
         )
-        neorepo.create(node)
 
-    if node.title != title:
+    if title is not None and node.title != title:
         node.title = title
-        neorepo.save(node)
     return node
 
 @db_session
@@ -222,10 +224,10 @@ def process(url:str) -> set[str]:
         commit()
 
         # adding links to graph
-        gfrom = get_or_create_graph_node(record.normalized_url, title)
+        gfrom = get_or_construct_graph_node(record.normalized_url, title)
         to_save = [gfrom]
         for linkurl in normalized_urls:
-            gto = get_or_create_graph_node(linkurl)
+            gto = get_or_construct_graph_node(linkurl)
             gfrom.linked_to.add(gto)
             gto.linked_from.add(gfrom)
             to_save.append(gto)
@@ -238,4 +240,4 @@ def process(url:str) -> set[str]:
     except Exception as ex:
         print(f'[{os.getpid()}] {ex}')
 
-    return set()   
+    return set()  
