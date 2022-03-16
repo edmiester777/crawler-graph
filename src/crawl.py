@@ -129,7 +129,7 @@ def normalizeurl(url: str) -> str:
     """
     Normalize a URL by removing trailing slash and scheme
     """
-    parsed = urlparse(url)
+    parsed = urlparse(url.strip())
 
     # host + path
     normalized = parsed.netloc + parsed.path
