@@ -52,23 +52,16 @@ class CrawlerDispatcher:
                 # simply continue loop here.
                 traceback.print_exc()
                 sleep(0.4)
-    @db_session
+
     def main_iter(self):
         """
         Main work function. This handles the bulk of the work for dispatching events
         and maintaining state.
         """
-        # we want to find items queued to be crawled
-        nextitems = select(item for item in PGCrawlerRecord if item.crawled == False)[:self.chunksize]
-
-        if len(nextitems) == 0:
-            # we did not receive any records. assume this is our first time running and
-            # add the seed record. then continue loop
-            nextitems = [PGCrawlerRecord(normalized_url=url, crawled=False) for url in SEED_URLS]
-            commit()
+        nextitems = self.get_next_records()
 
         #processing this chunk
-        futures = [self.executor.submit(process, item.normalized_url) for item in nextitems]
+        futures = [self.executor.submit(process, item) for item in nextitems]
         results, failed = wait(futures, return_when=ALL_COMPLETED, timeout=25)
 
         # if we timeout any futures, we will kill
@@ -83,16 +76,43 @@ class CrawlerDispatcher:
             uresults += result.result()
         uresults = set(uresults)
 
+        self.add_new_crawl_records(uresults)
+    
+    @db_session
+    def get_next_records(self) -> set[str]:
+        """
+        Get next URLs to be crawled. If none are available, we will seed and return
+        the seeds.
+        """
+
+        # we want to find items queued to be crawled
+        nextitems = select(item for item in PGCrawlerRecord if item.crawled == False)[:self.chunksize]
+
+        if len(nextitems) == 0:
+            # we did not receive any records. assume this is our first time running and
+            # add the seed record. then continue loop
+            nextitems = [PGCrawlerRecord(normalized_url=url, crawled=False) for url in SEED_URLS]
+            commit()
+
+        return set([i.normalized_url for i in nextitems])
+
+    @db_session
+    def add_new_crawl_records(self, newrecs:set[str]):
+        """
+        Add all new URLs to the crawl list.
+        """
+        
         # adding any new urls to future crawl list
         # we need to catch unique constraint errors because pony orm doesn't support
         # "where in" clauses for us to grab a list of records.
         numnewrecs = 0
-        for nurl in uresults:
+        for nurl in newrecs:
             if not PGCrawlerRecord.exists(normalized_url=nurl):
                 PGCrawlerRecord(normalized_url=nurl, crawled=False)
                 numnewrecs += 1
         
         print(f'[{os.getpid()}] Created {numnewrecs} future crawl records.')
+
 
 
 def normalizeurl(url: str) -> str:
