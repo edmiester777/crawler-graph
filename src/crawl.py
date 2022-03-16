@@ -1,8 +1,8 @@
 import os
 import re
 import traceback
-from asyncio import Future
-from concurrent.futures import ALL_COMPLETED, ProcessPoolExecutor, wait
+from asyncio import Future, wait_for
+from concurrent.futures import ALL_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from datetime import datetime
 from time import sleep
 from urllib.parse import urlparse
@@ -56,19 +56,23 @@ class CrawlerDispatcher:
     """
     def __init__(self, nproc:int=16):
         self.nproc = nproc
-        self.chunksize = nproc * 3
+        self.chunksize = nproc * 7
         self.executor = ProcessPoolExecutor(max_workers=nproc)
-        self.write_executor = ProcessPoolExecutor(max_workers=2)
+
+        # use threadpool because multiprocessing is not supported in neo4j driver
+        self.write_executor = ThreadPoolExecutor(max_workers=nproc)
+
         self.workqueue = []
 
     def begin(self):
         """
         Start the crawling process. This will continue until we receive a keyboard interrupt.
         """
+        neomodels.initialize()
         write_operations:list[Future] = None
         while True:
             try:
-                self.main_iter()
+                write_operations = self.main_iter(write_operations)
             except KeyboardInterrupt:
                 print('Process interrupted.')
                 break
@@ -77,7 +81,7 @@ class CrawlerDispatcher:
                 traceback.print_exc()
                 sleep(0.4)
 
-    def main_iter(self):
+    def main_iter(self, write_futures:list[Future]) -> list[Future]:
         """
         Main work function. This handles the bulk of the work for dispatching events
         and maintaining state.
@@ -100,11 +104,13 @@ class CrawlerDispatcher:
         # unwrapping results
         results = [result.result() for result in results]
 
+        # if there are ongoing write operations, wait for them to complete
+        if write_futures is not None:
+            wait(write_futures, return_when=ALL_COMPLETED)
+
         # Processing write operations asynchronously
-        wait([
-            self.executor.submit(process_write_neo4j, results),
-            self.executor.submit(process_write_postgres, results)
-        ], return_when=ALL_COMPLETED)
+        return [*[self.write_executor.submit(process_write_neo4j, result) for result in results],
+            self.write_executor.submit(process_write_postgres, results)]
     
     @db_session
     def get_next_records(self) -> set[str]:
@@ -170,12 +176,12 @@ def get_links_from_normalized_url(normalized_url: str) -> tuple[str, str, set[st
 
         # return a set of all links found
         return titlestr, response.text, set([normalizeurl(link.get('href')) for link in linktags])
-    except:
-        traceback.print_exc()
+    except Exception as ex:
+        print(f'[{os.getpid()} Encountered issue while downloading {normalized_url}: {ex}')
     
     return None
 
-def process_write_neo4j(results:list[CrawlResult]):
+def process_write_neo4j(result:CrawlResult):
     """
     Async writer process. This is done so we may continue to crawl while we perform
     our intense neo4j write operations.
@@ -188,27 +194,22 @@ def process_write_neo4j(results:list[CrawlResult]):
     :param results list of results from crawl operations
     """
     try:
-        neomodels.initialize()
         graph = neomodels.graph
 
-        # organizing data
-        all_new_links = set([link for cr in results for link in cr.links])
-
         # Merging nodes
-        transaction = graph.begin()
         gkeys = ['url', 'title']
-        ndata = [[cr.url, cr.title] for cr in results] \
-             + [[url, ''] for url in all_new_links]
-        merge_nodes(transaction, ndata, ('Record', 'url'), keys=gkeys, preserve=['url'])
+        ndata = [[result.url, result.title]] \
+             + [[url, ''] for url in result.links]
+        merge_nodes(graph.auto(), ndata, ('Record', 'url'), keys=gkeys, preserve=['url'])
 
         # Linking all data together
         ltodata = []
         lfromdata = []
-        for cr in results:
-            for tolink in cr.links:
-                ltodata.append((cr.url, [], tolink))
-                lfromdata.append((tolink, [], cr.url))
+        for tolink in result.links:
+            ltodata.append((result.url, [], tolink))
+            lfromdata.append((tolink, [], result.url))
 
+        transaction = graph.begin()
         merge_relationships(
             transaction,
             ltodata,
