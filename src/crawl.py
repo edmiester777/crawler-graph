@@ -62,7 +62,7 @@ class CrawlerDispatcher:
 
         #processing this chunk
         futures = [self.executor.submit(process, item) for item in nextitems]
-        results, failed = wait(futures, return_when=ALL_COMPLETED, timeout=25)
+        results, failed = wait(futures, return_when=ALL_COMPLETED, timeout=60)
 
         # if we timeout any futures, we will kill
         if len(failed) > 0:
