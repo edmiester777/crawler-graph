@@ -102,16 +102,19 @@ class CrawlerDispatcher:
         Add all new URLs to the crawl list.
         """
         
-        # adding any new urls to future crawl list
-        # we need to catch unique constraint errors because pony orm doesn't support
-        # "where in" clauses for us to grab a list of records.
-        numnewrecs = 0
-        for nurl in newrecs:
-            if not PGCrawlerRecord.exists(normalized_url=nurl):
-                PGCrawlerRecord(normalized_url=nurl, crawled=False)
-                numnewrecs += 1
+        # fetching records that already exist in database with same url
+        exists = select(r for r in PGCrawlerRecord if r.normalized_url in newrecs)[:]
+        existsurls = set([r.normalized_url for r in exists])
+
+        # filtering any existing records
+        inserturls = set([url for url in newrecs if url not in existsurls])
+
+        # inserting new records one by one.
+        # pony orm does not (from what I can find) yet support bulk insert operations.
+        for url in inserturls:
+            PGCrawlerRecord(normalized_url=url, crawled=False)
         
-        print(f'[{os.getpid()}] Created {numnewrecs} future crawl records.')
+        print(f'[{os.getpid()}] Created {len(inserturls)} future crawl records.')
 
 
 
