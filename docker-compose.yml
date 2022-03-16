@@ -10,6 +10,10 @@ services:
       NEO4J_AUTH: none # connect with no authentication
     volumes:
       - ./neo4j_data:/data:rw
+  neodash:
+    image: nielsdejong/neodash
+    ports:
+      - 8080:5005
   postgres:
     image: postgres:14.2
     ports:
